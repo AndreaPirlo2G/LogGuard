@@ -1,0 +1,11 @@
+build/
+build-*/
+*.o
+*.a
+*.ring
+*.lgp
+*.mcap
+compile_commands.json
+.cache/
+.vscode/
+.idea/
