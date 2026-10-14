@@ -82,10 +82,10 @@ struct RecorderHandle {
 //   LG_EVENT(LG_LEVEL_WARN, "auth", "login failed",
 //            logguard::Fields().num("user", 7).str("ip", "10.0.0.1"));
 #define LG_EVENT(lvl, cat, msg, fields_expr)                                      \
-    do { if ((lvl) >= lg_get_level()) {                                           \
-        ::logguard::Fields _lgf_ = (fields_expr);                                 \
-        lg_event((lvl), (cat), (msg), _lgf_.json().c_str());                      \
-    } } while (0)
+    LG_IF_ENABLED(lvl, if ((lvl) >= lg_get_level()) {                            \
+        ::logguard::Fields _lgf_ = (fields_expr);                                \
+        lg_event((lvl), (cat), (msg), _lgf_.json().c_str());                     \
+    })
 #endif
 
 #define LG_LOG_AT(lvl, cat, ...)                                                \

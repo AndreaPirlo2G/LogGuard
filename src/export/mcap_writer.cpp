@@ -4,7 +4,6 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
-
 namespace lg {
 
 namespace {
@@ -16,6 +15,17 @@ constexpr uint8_t OP_MESSAGE  = 0x05;
 constexpr uint8_t OP_CHUNK    = 0x0D;
 constexpr uint8_t OP_DATA_END = 0x0F;
 constexpr uint8_t OP_FOOTER   = 0x0E;
+// LogGuard-specific summary section: one entry per on-disk chunk. Unknown to
+// standard readers, which must skip unrecognised opcodes.
+constexpr uint8_t OP_CHUNK_INDEX = 0x40; // '@'
+// CHUNK_INDEX body:
+//   magic[4]   = "LGIX"
+//   version u8 = 1
+//   count   u32
+//   count * { mono_start i64, mono_end i64, file_offset u64,
+//             compressed_size u64, uncompressed_size u64, compression u8 }
+const uint8_t CHUNK_INDEX_MAGIC[4] = {'L', 'G', 'I', 'X'};
+constexpr uint8_t CHUNK_INDEX_VERSION = 1;
 
 const uint8_t MAGIC[9] = {0x89, 'M', 'C', 'A', 'P', '\r', '\n', 0x1A, '\n'};
 
@@ -66,7 +76,21 @@ void McapWriter::write_record(uint8_t op, const std::vector<uint8_t>& body) {
 }
 
 void McapWriter::begin(const std::string& compression) {
+    begin(compression, 0);
+}
+
+void McapWriter::begin(const std::string& compression, size_t target_chunk_bytes) {
     compression_ = compression;
+    constexpr size_t kMinTarget = 4 * 1024;
+    constexpr size_t kMaxTarget = 64ull * 1024 * 1024;
+    if (target_chunk_bytes == 0)
+        target_bytes_ = kChunkTargetBytes;
+    else if (target_chunk_bytes < kMinTarget)
+        target_bytes_ = kMinTarget;
+    else if (target_chunk_bytes > kMaxTarget)
+        target_bytes_ = kMaxTarget;
+    else
+        target_bytes_ = target_chunk_bytes;
     FILE* fp = static_cast<FILE*>(f_);
     std::fwrite(MAGIC, 1, sizeof(MAGIC), fp);
     {
@@ -137,8 +161,8 @@ void McapWriter::append_message(std::vector<uint8_t>& out, uint32_t seq, uint16_
     std::vector<uint8_t> rec;
     put_u16(rec, 1);
     put_u32(rec, seq);
-    put_i64(rec, wall_ns);
-    put_i64(rec, wall_ns);
+    put_i64(rec, wall_ns);  // log_time: wall clock for human readers
+    put_i64(rec, mono_ns);  // publish_time: monotonic clock, used by index
     rec.insert(rec.end(), json.begin(), json.end());
 
     uint8_t hdr[9]; hdr[0] = OP_MESSAGE;
@@ -152,13 +176,49 @@ void McapWriter::write_log(uint32_t seq, uint16_t level, uint64_t ticket, uint64
                            int64_t wall_ns, int64_t mono_ns,
                            const char* category, const char* req_id, const char* msg,
                            const char* fields_json) {
+    (void)seq_cursor_;
     append_message(chunk_, seq, level, ticket, tid, wall_ns, mono_ns,
                    category, req_id, msg, fields_json);
+    if (!cur_has_span_) {
+        cur_mono_start_ = cur_mono_end_ = mono_ns;
+        cur_has_span_ = true;
+    } else {
+        if (mono_ns < cur_mono_start_) cur_mono_start_ = mono_ns;
+        if (mono_ns > cur_mono_end_) cur_mono_end_ = mono_ns;
+    }
+    if (chunk_.size() >= target_bytes_) flush_chunk();
+}
+
+void McapWriter::write_log_raw(uint32_t seq, int64_t wall_ns, int64_t mono_ns,
+                            const std::string& json_payload) {
+    std::vector<uint8_t> rec;
+    put_u16(rec, 1); // channel /logguard/logs
+    put_u32(rec, seq);
+    put_i64(rec, wall_ns);
+    put_i64(rec, mono_ns);
+    rec.insert(rec.end(), json_payload.begin(), json_payload.end());
+    // Frame exactly like append_message: 9-byte record header inside the chunk.
+    uint8_t hdr[9];
+    hdr[0] = OP_MESSAGE;
+    uint64_t rlen = rec.size();
+    std::memcpy(hdr + 1, &rlen, 8);
+    chunk_.insert(chunk_.end(), hdr, hdr + 9);
+    chunk_.insert(chunk_.end(), rec.begin(), rec.end());
+    if (!cur_has_span_) {
+        cur_mono_start_ = cur_mono_end_ = mono_ns;
+        cur_has_span_ = true;
+    } else {
+        if (mono_ns < cur_mono_start_) cur_mono_start_ = mono_ns;
+        if (mono_ns > cur_mono_end_) cur_mono_end_ = mono_ns;
+    }
+    if (chunk_.size() >= target_bytes_) flush_chunk();
 }
 
 void McapWriter::write_manifest(int64_t wall_ns, const std::string& json) {
     // Channel id 2, log_time/publish_time = wall_ns, payload is the manifest
-    // JSON object verbatim.
+    // JSON object verbatim. Stored as a framed message and prepended to the
+    // first chunk when it is flushed, so it stays the first record even when
+    // the package spans several chunks.
     std::vector<uint8_t> rec;
     put_u16(rec, 2);
     put_u32(rec, 0); // sequence
@@ -166,36 +226,78 @@ void McapWriter::write_manifest(int64_t wall_ns, const std::string& json) {
     put_i64(rec, wall_ns);
     rec.insert(rec.end(), json.begin(), json.end());
 
-    // Prepend manifest so it is the first message record in the chunk.
-    std::vector<uint8_t> framed;
     uint8_t hdr[9]; hdr[0] = OP_MESSAGE;
     uint64_t len = rec.size();
     std::memcpy(hdr + 1, &len, 8);
-    framed.insert(framed.end(), hdr, hdr + 9);
-    framed.insert(framed.end(), rec.begin(), rec.end());
-    chunk_.insert(chunk_.begin(), framed.begin(), framed.end());
+    manifest_rec_.insert(manifest_rec_.end(), hdr, hdr + 9);
+    manifest_rec_.insert(manifest_rec_.end(), rec.begin(), rec.end());
+}
+
+void McapWriter::flush_chunk() {
+    if (chunk_.empty()) return;
+    FILE* fp = static_cast<FILE*>(f_);
+
+    // The first physical chunk also carries the manifest record at its head so
+    // the package remains self-describing regardless of how many chunks follow.
+    std::vector<uint8_t> raw;
+    raw.reserve(manifest_rec_.size() + chunk_.size());
+    if (!manifest_rec_.empty())
+        raw.insert(raw.end(), manifest_rec_.begin(), manifest_rec_.end());
+    raw.insert(raw.end(), chunk_.begin(), chunk_.end());
+
+    bool want_zstd = compression_ == "zstd";
+    auto& codec = export_::ZstdCodec::instance();
+    std::vector<uint8_t> payload;
+    std::string used = "none";
+    if (want_zstd && codec.available()) {
+        payload = codec.compress(raw.data(), raw.size());
+        if (!payload.empty()) used = "zstd";
+    }
+    if (used != "zstd") payload = raw;
+
+    const uint64_t offset =
+        static_cast<uint64_t>(std::ftell(fp));
+
+    std::vector<uint8_t> body;
+    put_string(body, used);                 // compression
+    put_u64(body, raw.size());              // uncompressed size
+    put_u32(body, 0);                       // uncompressed crc
+    body.insert(body.end(), payload.begin(), payload.end());
+    write_record(OP_CHUNK, body);
+
+    if (cur_has_span_) {
+        ChunkMeta m;
+        m.mono_start = cur_mono_start_;
+        m.mono_end = cur_mono_end_;
+        m.file_offset = offset;
+        m.compressed_size = 9 + body.size(); // record header + body bytes
+        m.uncompressed_size = raw.size();
+        m.compression = (used == "zstd") ? 1u : 0u;
+        index_.push_back(m);
+    }
+    manifest_rec_.clear();
+    chunk_.clear();
+    cur_has_span_ = false;
 }
 
 void McapWriter::finish() {
-    // Flush buffered messages as one Chunk (compressed if requested/available).
-    if (!chunk_.empty()) {
-        bool want_zstd = compression_ == "zstd";
-        auto& codec = export_::ZstdCodec::instance();
-        std::vector<uint8_t> payload;
-        std::string used = "none";
-        if (want_zstd && codec.available()) {
-            payload = codec.compress(chunk_.data(), chunk_.size());
-            if (!payload.empty()) used = "zstd";
-        }
-        if (used != "zstd") payload = chunk_;
+    flush_chunk();
 
-        std::vector<uint8_t> body;
-        put_string(body, used);                 // compression
-        put_u64(body, chunk_.size());           // uncompressed size
-        put_u32(body, 0);                       // uncompressed crc
-        body.insert(body.end(), payload.begin(), payload.end());
-        write_record(OP_CHUNK, body);
-        chunk_.clear();
+    // Trailing chunk time index (skipped by readers that lack the opcode).
+    if (!index_.empty()) {
+        std::vector<uint8_t> b;
+        b.insert(b.end(), CHUNK_INDEX_MAGIC, CHUNK_INDEX_MAGIC + 4);
+        b.push_back(CHUNK_INDEX_VERSION);
+        put_u32(b, static_cast<uint32_t>(index_.size()));
+        for (const auto& m : index_) {
+            put_i64(b, m.mono_start);
+            put_i64(b, m.mono_end);
+            put_u64(b, m.file_offset);
+            put_u64(b, m.compressed_size);
+            put_u64(b, m.uncompressed_size);
+            b.push_back(m.compression);
+        }
+        write_record(OP_CHUNK_INDEX, b);
     }
     {
         std::vector<uint8_t> b; put_u32(b, 0);

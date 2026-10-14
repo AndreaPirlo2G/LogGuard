@@ -37,6 +37,8 @@ struct VerifyReport {
     uint32_t manifest_count = 0;  // /logguard/manifest messages
     uint32_t chunk_count = 0;
     uint32_t bad_chunks = 0;         // truncated/undecompressable chunks
+    bool has_chunk_index = false;    // a LogGuard CHUNK_INDEX section was seen
+    uint32_t indexed_chunks = 0;     // entries parsed from the index
     uint64_t parsed_bytes = 0;       // how much of the input was walked
     std::vector<VerifyIssue> issues;
 
@@ -72,7 +74,8 @@ public:
     // top-level records and decompressing chunks. Used by tools; empty on
     // hard failure. |out_json| receives raw JSON payloads in file order.
     struct LogMessage {
-        uint64_t log_time_ns = 0;
+        uint64_t log_time_ns = 0;   // wall clock
+        int64_t mono_time_ns = 0;   // monotonic clock (publish_time)
         uint16_t channel_id = 0;
         std::string json;
     };
@@ -88,6 +91,37 @@ public:
     // returned (a package normally has exactly one).
     static bool extract_manifest_file(const std::string& path,
                                       std::string& json_out);
+
+    // One entry of the trailing LogGuard chunk time index.
+    struct ChunkIndexEntry {
+        int64_t mono_start_ns = 0;
+        int64_t mono_end_ns = 0;
+        uint64_t file_offset = 0;   // absolute byte offset of the chunk record
+        uint64_t compressed_size = 0;
+        uint64_t uncompressed_size = 0;
+        bool zstd = false;
+    };
+
+    // Parse the trailing CHUNK_INDEX section. Returns false for packages
+    // written without an index (older single-chunk files); malformed sections
+    // report a verify issue and return false.
+    static bool read_chunk_index(const uint8_t* data, size_t size,
+                                 std::vector<ChunkIndexEntry>& out,
+                                 VerifyReport* report = nullptr);
+    static bool read_chunk_index_file(const std::string& path,
+                                      std::vector<ChunkIndexEntry>& out);
+
+    // Extract log messages whose monotonic timestamp falls in [from,to],
+    // using the chunk index to inflate only intersecting chunks. Bounds
+    // INT64_MIN/MAX act as open ranges. Falls back to a full linear scan when
+    // the package has no index (older files). Returns false only on a
+    // structural parse error; an empty result set is still true.
+    static bool extract_range_file(const std::string& path,
+                                   int64_t from_mono_ns, int64_t to_mono_ns,
+                                   std::vector<LogMessage>& out);
+    static bool extract_range_file_blob(const std::vector<uint8_t>& image,
+                                        int64_t from_mono_ns, int64_t to_mono_ns,
+                                        std::vector<LogMessage>& out);
 };
 
 } // namespace export_

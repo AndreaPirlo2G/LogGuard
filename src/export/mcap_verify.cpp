@@ -28,6 +28,11 @@ constexpr uint8_t OP_MESSAGE = 0x05;
 constexpr uint8_t OP_CHUNK = 0x0D;
 constexpr uint8_t OP_DATA_END = 0x0F;
 constexpr uint8_t OP_FOOTER = 0x0E;
+constexpr uint8_t OP_CHUNK_INDEX = 0x40; // LogGuard-specific summary section
+
+const uint8_t kChunkIndexMagic[4] = {'L', 'G', 'I', 'X'};
+constexpr uint8_t kChunkIndexVersion = 1;
+constexpr uint32_t kMaxChunkIndexEntries = 1u << 20; // 1 M chunks per package
 
 // Bounds-checked cursor over a byte span. All multi-byte readers return false
 // rather than reading out of bounds.
@@ -63,6 +68,12 @@ struct Cursor {
     bool u16(uint16_t& v) { return le(v); }
     bool u32(uint32_t& v) { return le(v); }
     bool u64(uint64_t& v) { return le(v); }
+    bool i64(int64_t& v) {
+        uint64_t raw = 0;
+        if (!le(raw)) return false;
+        std::memcpy(&v, &raw, sizeof(v));
+        return true;
+    }
 
     // Read a length-prefixed string as a span (no allocation/copy).
     bool str_span(const uint8_t*& p, uint32_t& n) {
@@ -87,7 +98,8 @@ bool read_file_bytes(const std::string& path, std::vector<uint8_t>& out) {
 void walk(const uint8_t* data, size_t size, uint32_t depth,
           std::map<uint16_t, std::string>& topics, VerifyReport& rep,
           std::vector<McapVerifier::LogMessage>* out,
-          std::vector<std::string>* manifests = nullptr) {
+          std::vector<std::string>* manifests = nullptr,
+          bool metadata_only = false) {
     Cursor cur(data, size);
     while (cur.need(9)) {
         const size_t rec_abs = cur.pos;
@@ -165,6 +177,7 @@ void walk(const uint8_t* data, size_t size, uint32_t depth,
                     if (it != topics.end() && it->second == "/logguard/logs") {
                         McapVerifier::LogMessage m;
                         m.log_time_ns = lt;
+                        m.mono_time_ns = static_cast<int64_t>(pt);
                         m.channel_id = ch;
                         m.json.assign(
                             reinterpret_cast<const char*>(body + consumed),
@@ -183,6 +196,7 @@ void walk(const uint8_t* data, size_t size, uint32_t depth,
         }
         case OP_CHUNK: {
             ++rep.chunk_count;
+            if (metadata_only) break; // only gathering top-level channel map
             if (depth + 1 > McapVerifier::kMaxNesting) {
                 rep.warn("chunk nesting limit reached; skipped", rec_abs);
                 break;
@@ -236,6 +250,35 @@ void walk(const uint8_t* data, size_t size, uint32_t depth,
         case OP_DATA_END:
             rep.has_data_end = true;
             break;
+        case OP_CHUNK_INDEX: {
+            // Validate the section structurally (the hardening target) but do
+            // not need its entries during a plain verify.
+            Cursor bc(body, len);
+            const uint8_t* mg = nullptr;
+            if (!bc.take(4, mg) ||
+                std::memcmp(mg, kChunkIndexMagic, 4) != 0) {
+                rep.warn("malformed chunk index magic", rec_abs);
+                break;
+            }
+            uint8_t ver = 0;
+            uint32_t cnt = 0;
+            if (!bc.u8(ver) || !bc.u32(cnt)) {
+                rep.warn("truncated chunk index header", rec_abs);
+                break;
+            }
+            if (ver != kChunkIndexVersion || cnt > kMaxChunkIndexEntries) {
+                rep.warn("unsupported chunk index version/count", rec_abs);
+                break;
+            }
+            // 33 bytes per entry (i64+i64+u64+u64+u64+u8).
+            if (!bc.need(size_t(cnt) * 33)) {
+                rep.warn("chunk index overruns record body", rec_abs);
+                break;
+            }
+            rep.has_chunk_index = true;
+            rep.indexed_chunks = cnt;
+            break;
+        }
         case OP_FOOTER:
             rep.has_footer = true;
             rep.parsed_bytes = cur.pos;
@@ -338,6 +381,167 @@ bool McapVerifier::extract_manifest_file(const std::string& path,
     if (manifests.empty()) return false;
     json_out = std::move(manifests.back());
     return true;
+}
+
+bool McapVerifier::read_chunk_index(const uint8_t* data, size_t size,
+                                    std::vector<ChunkIndexEntry>& out,
+                                    VerifyReport* report) {
+    out.clear();
+    if (!data || size < kMagicLen + 1) return false;
+    if (std::memcmp(data, kMagic, kMagicLen) != 0) return false;
+
+    const uint8_t* p = data + kMagicLen;
+    const size_t begin = kMagicLen;
+    size_t off = begin;
+    while (off + 9 <= size) {
+        const uint8_t opcode = data[off];
+        uint64_t rlen64 = 0;
+        std::memcpy(&rlen64, data + off + 1, 8);
+        if (rlen64 > McapVerifier::kMaxRecordLen) break;
+        const size_t rlen = static_cast<size_t>(rlen64);
+        // Overflow-safe: compare within [off,size] instead of adding pointers.
+        if (rlen > size - (off + 9)) break; // footer/closing magic in the tail
+        const uint8_t* body = data + off + 9;
+        if (opcode == OP_CHUNK_INDEX) {
+            Cursor c(body, rlen);
+            const uint8_t* mg = nullptr;
+            uint8_t ver = 0;
+            uint32_t cnt = 0;
+            if (!c.take(4, mg) ||
+                std::memcmp(mg, kChunkIndexMagic, 4) != 0 ||
+                !c.u8(ver) || !c.u32(cnt) || ver != kChunkIndexVersion ||
+                cnt > kMaxChunkIndexEntries ||
+                !c.need(size_t(cnt) * 33)) {
+                if (report) report->warn("invalid chunk index section");
+                return false;
+            }
+            out.reserve(cnt);
+            for (uint32_t i = 0; i < cnt; ++i) {
+                ChunkIndexEntry e;
+                if (!c.i64(e.mono_start_ns) || !c.i64(e.mono_end_ns) ||
+                    !c.u64(e.file_offset) || !c.u64(e.compressed_size) ||
+                    !c.u64(e.uncompressed_size))
+                    return false;
+                uint8_t flag = 0;
+                if (!c.u8(flag)) return false;
+                e.zstd = flag != 0;
+                out.push_back(e);
+            }
+            return true;
+        }
+        off += 9 + rlen;
+    }
+    return false;
+}
+
+bool McapVerifier::read_chunk_index_file(const std::string& path,
+                                         std::vector<ChunkIndexEntry>& out) {
+    std::vector<uint8_t> buf;
+    if (!read_file_bytes(path, buf)) return false;
+    return read_chunk_index(buf.data(), buf.size(), out);
+}
+
+bool McapVerifier::extract_range_file_blob(const std::vector<uint8_t>& buf,
+                                           int64_t from_mono_ns,
+                                           int64_t to_mono_ns,
+                                           std::vector<LogMessage>& out) {
+    out.clear();
+    if (buf.size() < kMagicLen ||
+        std::memcmp(buf.data(), kMagic, kMagicLen) != 0)
+        return false;
+
+    std::vector<ChunkIndexEntry> idx;
+    if (!read_chunk_index(buf.data(), buf.size(), idx) || idx.empty()) {
+        // Older single-chunk package: fall back to a linear walk.
+        VerifyReport rep;
+        std::vector<LogMessage> all;
+        if (!extract_logs(buf.data(), buf.size(), all, &rep)) return false;
+        for (auto& m : all) {
+            if (m.mono_time_ns >= from_mono_ns &&
+                m.mono_time_ns <= to_mono_ns)
+                out.push_back(std::move(m));
+        }
+        return true;
+    }
+
+    // Chunks are written in monotonic order; binary-search the first chunk
+    // whose end >= from, then walk while start <= to.
+    auto end_ge = [&](size_t i) { return idx[i].mono_end_ns >= from_mono_ns; };
+    size_t lo = 0, hi = idx.size();
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (end_ge(mid))
+            hi = mid;
+        else
+            lo = mid + 1;
+    }
+    const size_t start_chunk = lo;
+
+    // One cheap top-level pass collects the channel-id -> topic map without
+    // inflating any chunk; channels live outside the chunks.
+    std::map<uint16_t, std::string> topics;
+    VerifyReport meta;
+    walk(buf.data() + kMagicLen, buf.size() - kMagicLen, 0, topics, meta,
+         nullptr, nullptr, /*metadata_only=*/true);
+
+    for (size_t i = start_chunk; i < idx.size() &&
+                                idx[i].mono_start_ns <= to_mono_ns;
+         ++i) {
+        const ChunkIndexEntry& e = idx[i];
+        if (e.file_offset >= buf.size()) continue;
+        const size_t fo = static_cast<size_t>(e.file_offset);
+        const uint8_t* rec = buf.data() + fo;
+        if (fo + 9 > buf.size()) continue;
+        if (rec[0] != OP_CHUNK) continue;
+        uint64_t rlen64 = 0;
+        std::memcpy(&rlen64, rec + 1, 8);
+        if (rlen64 > McapVerifier::kMaxRecordLen) continue;
+        const size_t rlen = static_cast<size_t>(rlen64);
+        if (rlen > buf.size() - (fo + 9)) continue;
+        const uint8_t* body = rec + 9;
+        // Chunk header: [str compression][u64 uncompressed_size][u32 crc].
+        Cursor hc(body, rlen);
+        const uint8_t* encp = nullptr;
+        uint32_t enc_len = 0;
+        uint64_t usize = 0;
+        uint32_t crc = 0;
+        if (!hc.str_span(encp, enc_len) || !hc.u64(usize) || !hc.u32(crc))
+            continue;
+        const uint8_t* dptr = body + hc.pos;
+        size_t dlen = rlen - hc.pos;
+        std::string encoding(reinterpret_cast<const char*>(encp), enc_len);
+
+        const uint8_t* in = nullptr;
+        size_t in_len = 0;
+        std::vector<uint8_t> inflated;
+        if (encoding == "zstd") {
+            inflated = ZstdCodec::instance().decompress(dptr, dlen,
+                                                        static_cast<size_t>(usize));
+            if (inflated.empty()) continue;
+            in = inflated.data();
+            in_len = inflated.size();
+        } else {
+            in = dptr;
+            in_len = dlen;
+        }
+        VerifyReport sub;
+        std::vector<LogMessage> msgs;
+        walk(in, in_len, 0, topics, sub, &msgs, nullptr);
+        for (auto& m : msgs) {
+            if (m.mono_time_ns >= from_mono_ns &&
+                m.mono_time_ns <= to_mono_ns)
+                out.push_back(std::move(m));
+        }
+    }
+    return true;
+}
+
+bool McapVerifier::extract_range_file(const std::string& path,
+                                      int64_t from_mono_ns, int64_t to_mono_ns,
+                                      std::vector<LogMessage>& out) {
+    std::vector<uint8_t> buf;
+    if (!read_file_bytes(path, buf)) return false;
+    return extract_range_file_blob(buf, from_mono_ns, to_mono_ns, out);
 }
 
 } // namespace export_

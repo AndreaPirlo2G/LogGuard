@@ -33,18 +33,24 @@ marketed. Version numbers are indicative.
 - [x] Crash-handler chaining for Crashpad/Breakpad coexistence (POSIX)
 - [x] Stall watchdog with all-thread stack capture
 - [x] SIGUSR1 runtime level change
-- [ ] Compile-out gate (`LG_ENABLE`) for zero-overhead release builds
-- [ ] MCAP message-index section for indexed readers
-- [ ] Export-time redaction hooks and redaction-report attachment
-- [ ] Hardened reader bounds; fuzz the parser path
-- [ ] p50/p99 benchmarks across message lengths and thread counts
+- [x] Compile-out gate (`LG_LOGGING_ENABLED`, `LG_COMPILE_MIN_LEVEL`, C `LG_C_*`
+      macros; CMake `LG_LOGGING_ENABLED` / `LG_COMPILE_MIN_LEVEL` options)
+- [x] MCAP chunk time-index section for O(log n) windowed extraction
+- [x] Export-time redaction hooks, per-family redaction report in the manifest,
+      `lgtool redact` package rewriter and `recover --redact`
+- [x] Hardened reader bounds; deterministic mutation fuzzing of the parser
+- [x] p50/p99 benchmarks across message lengths and thread counts
+      (`bench_hotpath --matrix`)
+- [x] Export-time source locations via addr2line (`file:line`, batched per
+      module; degrades to dladdr-only when binutils/debug info are absent)
 
 ## v0.4 — platforms and ecosystem
 
 - [ ] Windows backend: finish `CreateFileMapping` + VEH behind the existing
       `mapping_windows.cpp` / `crash_windows.cpp` boundary
 - [ ] macOS (mach exception / `pthread_mach_threads_np` stacks)
-- [ ] Symbolicated stack traces (`addr2line`/DbgHelp integration or docs)
+- [x] Symbolicated stack traces (dladdr nearest symbol + batched addr2line
+      `file:line` at export time; Windows DbgHelp still pending)
 - [ ] OpenTelemetry context propagation alignment
 - [ ] GitHub Action: diff PR runs against baseline and comment on new errors
 - [ ] vcpkg / conan / brew packaging, SBOM

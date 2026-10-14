@@ -257,7 +257,12 @@ int Recorder::open(const RecorderConfig& cfg, const lg::InitOpts& opts,
     if (c.zstd_compression)
         zstd_ = export_::ZstdCodec::instance().available();
     symbolize_ = c.symbolize_stack;
-    if (symbolize_) symbolizer_.load_self();
+    if (symbolize_) {
+        symbolizer_.load_self();
+        // Best-effort file:line resolution via addr2line at export time;
+        // silently stays dladdr-only when binutils is unavailable.
+        symbolizer_.enable_source_locations(true);
+    }
 
     burst_enabled_ = c.burst_suppression;
     if (burst_enabled_) {

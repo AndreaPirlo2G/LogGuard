@@ -17,6 +17,8 @@
 #include "core/ring_reader.hpp"
 #include "export/query.hpp"
 #include "export/retention.hpp"
+#include "export/redaction.hpp"
+#include "export/mcap_writer.h"
 #include "platform/clock.hpp"
 #include "diagnosis/session_stats.hpp"
 #include "diagnosis/fingerprint.hpp"
@@ -494,6 +496,37 @@ static int cmd_manifest(const std::string& path) {
     return 0;
 }
 
+// range <file> --from-ns N --to-ns N   (monotonic nanoseconds, open bounds ok)
+// Uses the chunk time index to inflate only intersecting chunks; packages
+// without an index fall back to a full linear scan.
+static int cmd_range(int argc, char** argv) {
+    if (argc < 3) {
+        fprintf(stderr, "usage: lgtool range <file> [--from-ns N] [--to-ns N]\n");
+        return 2;
+    }
+    const std::string path = argv[2];
+    int64_t from = INT64_MIN, to = INT64_MAX;
+    for (int i = 3; i + 1 < argc; ++i) {
+        std::string k = argv[i];
+        if (k == "--from-ns") from = strtoll(argv[++i], nullptr, 10);
+        else if (k == "--to-ns") to = strtoll(argv[++i], nullptr, 10);
+    }
+    std::vector<lg::export_::McapVerifier::ChunkIndexEntry> idx;
+    bool indexed = lg::export_::McapVerifier::read_chunk_index_file(path, idx);
+    std::vector<lg::export_::McapVerifier::LogMessage> hits;
+    if (!lg::export_::McapVerifier::extract_range_file(path, from, to, hits)) {
+        fprintf(stderr, "failed to parse %s\n", path.c_str());
+        return 2;
+    }
+    for (auto& m : hits)
+        printf("%s\n", m.json.c_str());
+    fprintf(stderr, "%zu matched (%s)%s\n", hits.size(),
+            indexed ? "indexed seek" : "linear fallback",
+            indexed ? (" over " + std::to_string(idx.size()) + " chunks").c_str()
+                    : "");
+    return hits.empty() ? 1 : 0;
+}
+
 // prune <dir> [--files N] [--mb N] [--age-hours H] [--dry-run]
 static int cmd_prune(int argc, char** argv) {
     if (argc < 3) {
@@ -550,6 +583,122 @@ static int cmd_prune(int argc, char** argv) {
     return 0;
 }
 
+// redact <in.lgp> <out.lgp> [--family phone,email,...] [--token T]...
+// Re-packages an existing incident file with PII/secrets masked. Every log
+// payload is passed through the same deterministic scanner the live exporter
+// uses; the output package carries a "redaction_report" in its manifest.
+static int cmd_redact(int argc, char** argv) {
+    if (argc < 4) {
+        fprintf(stderr, "usage: lgtool redact <in.lgp> <out.lgp> "
+                        "[--family f1,f2,...] [--token SECRET]... [--zstd]\n");
+        return 2;
+    }
+    const std::string in = argv[2], out = argv[3];
+    bool zstd = false;
+    lg::export_::Redactor red;
+    // Start with every family disabled, enable only the requested set. With
+    // no --family, the default (all families) applies.
+    bool family_filter = false;
+    using K = lg::export_::SensitiveKind;
+    const struct { const char* name; K kind; } table[] = {
+        {"phone", K::Phone}, {"email", K::Email}, {"id_card", K::IdCard},
+        {"bank_card", K::BankCard}, {"ipv4", K::IPv4}, {"secret", K::Secret},
+    };
+    for (int i = 4; i < argc; ++i) {
+        std::string f = argv[i];
+        if (f == "--zstd") { zstd = true; continue; }
+        if (f == "--token" && i + 1 < argc) {
+            red.add_custom_token(argv[++i]);
+            continue;
+        }
+        if (f == "--family" && i + 1 < argc) {
+            if (!family_filter) {
+                for (const auto& t : table) red.enable(t.kind, false);
+                red.enable(K::Custom, true);
+                family_filter = true;
+            }
+            std::string list = argv[++i];
+            size_t pos = 0;
+            while (pos < list.size()) {
+                size_t comma = list.find(',', pos);
+                std::string name = list.substr(pos, comma == std::string::npos
+                                                       ? std::string::npos
+                                                       : comma - pos);
+                bool known = false;
+                for (const auto& t : table)
+                    if (name == t.name) { red.enable(t.kind, true); known = true; }
+                if (!known && name != "custom")
+                    fprintf(stderr, "warning: unknown family '%s'\n",
+                            name.c_str());
+                if (comma == std::string::npos) break;
+                pos = comma + 1;
+            }
+            continue;
+        }
+        fprintf(stderr, "unknown flag: %s\n", f.c_str());
+        return 2;
+    }
+
+    std::vector<lg::export_::McapVerifier::LogMessage> logs;
+    if (!lg::export_::McapVerifier::extract_logs_file(in, logs, nullptr)) {
+        fprintf(stderr, "failed to read package: %s\n", in.c_str());
+        return 1;
+    }
+    std::string old_manifest;
+    lg::export_::McapVerifier::extract_manifest_file(in, old_manifest);
+
+    lg::McapWriter w;
+    if (!w.open(out)) {
+        fprintf(stderr, "cannot open output: %s\n", out.c_str());
+        return 1;
+    }
+    w.begin(zstd ? "zstd" : "none");
+
+    int64_t wall = lg::plat::wall_now_ns();
+    lg::export_::RedactionStats acc;
+    char num[128];
+    std::string manifest = "{\"producer\":\"logguard\",\"version\":\"0.4.0\",";
+    manifest += "\"tool\":\"lgtool redact\"";
+    manifest += ",\"source\":";
+    { // JSON-escape the source basename defensively.
+        manifest += '"';
+        for (char c : in) {
+            if (c == '"' || c == '\\') manifest += '\\';
+            manifest += c;
+        }
+        manifest += '"';
+    }
+    std::snprintf(num, sizeof(num), ",\"exported_at_ns\":%lld,\"events\":%zu",
+                  (long long)wall, logs.size());
+    manifest += num;
+    manifest += ",\"compression\":";
+    manifest += zstd ? "\"zstd\"" : "\"none\"";
+    manifest += ",\"redacted\":true,\"redaction_report\":{";
+
+    uint32_t seq = 0;
+    for (auto& m : logs) {
+        auto st = red.apply(m.json);
+        acc.phone += st.phone; acc.email += st.email; acc.id_card += st.id_card;
+        acc.bank_card += st.bank_card; acc.ipv4 += st.ipv4;
+        acc.secret += st.secret; acc.custom += st.custom;
+        w.write_log_raw(seq++, m.log_time_ns, m.mono_time_ns, m.json);
+    }
+    std::snprintf(num, sizeof(num),
+        "\"phone\":%d,\"email\":%d,\"id_card\":%d,\"bank_card\":%d,"
+        "\"ipv4\":%d,\"secret\":%d,\"custom\":%d,\"total\":%d}}",
+        acc.phone, acc.email, acc.id_card, acc.bank_card, acc.ipv4,
+        acc.secret, acc.custom, acc.total());
+    manifest += num;
+    w.write_manifest(wall, manifest);
+    w.finish();
+
+    printf("redacted %zu records -> %s; masked %d token(s) "
+           "(phone=%d email=%d id=%d bank=%d ip=%d secret=%d custom=%d)\n",
+           logs.size(), out.c_str(), acc.total(), acc.phone, acc.email,
+           acc.id_card, acc.bank_card, acc.ipv4, acc.secret, acc.custom);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     if (argc < 3) {
         fprintf(stderr, "usage:\n"
@@ -564,11 +713,16 @@ int main(int argc, char** argv) {
                         "  lgtool verify <file.lgp>\n"
                         "  lgtool manifest <file.lgp>\n"
                         "  lgtool audit <ring>\n"
-                        "  lgtool prune <dir> [--files N] [--mb N] [--age-hours H] [--dry-run]\n");
+                        "  lgtool prune <dir> [--files N] [--mb N] [--age-hours H] [--dry-run]\n"
+                        "  lgtool redact <in.lgp> <out.lgp> [--family f1,f2] [--token T]... [--zstd]\n");
         return 2;
     }
     std::string cmd = argv[1], path = argv[2];
-    if (cmd == "recover") return lg_recover_export(path.c_str());
+    if (cmd == "recover") {
+        if (argc >= 4 && std::string(argv[3]) == "--redact")
+            return lg_recover_export_redacted(path.c_str());
+        return lg_recover_export(path.c_str());
+    }
     if (cmd == "cat") return cmd_cat(path);
     if (cmd == "info") return cmd_info(path);
     if (cmd == "query") return cmd_query(path, argc >= 4 ? argv[3] : "");
@@ -583,8 +737,10 @@ int main(int argc, char** argv) {
     }
     if (cmd == "verify") return cmd_verify(path);
     if (cmd == "manifest") return cmd_manifest(path);
+    if (cmd == "range") return cmd_range(argc, argv);
     if (cmd == "audit") return cmd_audit(path);
     if (cmd == "prune") return cmd_prune(argc, argv);
+    if (cmd == "redact") return cmd_redact(argc, argv);
     fprintf(stderr, "unknown command: %s\n", cmd.c_str());
     return 2;
 }

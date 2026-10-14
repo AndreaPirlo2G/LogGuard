@@ -19,7 +19,9 @@ result in [Foxglove Studio](https://foxglove.dev/) or any MCAP reader.
 > recorders behind stable C ABI handles, an **ordered event-sequence rule**
 > engine, optional stack **symbolization** at export, **privacy redaction**, a
 > defensive **MCAP verifier** (`lgtool verify`, fuzz-hardened), ring health
-> **auditing** (`lgtool audit`), and a compile-time **zero-cost log cutoff**.
+> **auditing** (`lgtool audit`), a compile-time **zero-cost log cutoff**,
+> rolling chunks with a **time index for O(log n) windowed extraction**
+> (`lgtool range`), and deterministic parser **mutation fuzzing**.
 > See the [roadmap](docs/roadmap.md).
 
 ## Why
@@ -93,8 +95,12 @@ not a private format.
 **Output & ops**
 - **Standard MCAP output** — schema/channel records, self-describing, opens in
   Foxglove Studio and any MCAP reader; no private binary format.
+- **Indexed chunks** — a package is written as rolling chunks with a trailing
+  time index, so a time-window query (`lgtool range`) binary-searches the index
+  and inflates only the chunks that overlap, instead of scanning the whole
+  file. Old single-chunk packages still work via an automatic linear fallback.
 - **CLI** — `recover`, `info`, `cat`, `query`, `report`, `fingerprint`,
-  `diff`, `tail`, `scan`, `verify`, `manifest`, `audit`, `prune`.
+  `diff`, `tail`, `scan`, `range`, `verify`, `manifest`, `audit`, `prune`.
 - **Self-contained HTML report** — one file to attach straight to a ticket.
 - **Runtime log-level changes** — `SIGUSR1` cycles level on a live process.
 - **Bounded resources, hard isolation** — fixed file, capped memory, no
@@ -124,12 +130,16 @@ lgtool recover <ring>                    # export an unclean ring
 lgtool info    <file.lgp>                # counts, levels, categories, span
 lgtool cat     <file.lgp>                # records as JSON lines
 lgtool query   <file.lgp> 'request_id":"tx-3'   # substring filter
+lgtool range   <file.lgp> --from-ns A --to-ns B  # monotonic window, index seek
+lgtool redact  <file.lgp> <out.lgp>       # rewrite with PII/secrets masked
 lgtool report  <file.lgp> report.html    # self-contained HTML report
 lgtool tail    <ring>                    # live view of a running process
 lgtool fingerprint <file.lgp|file.fp>    # error signatures + counts
 lgtool diff <baseline> <candidate>       # new/removed/regressed; exit 1 on regression
 lgtool verify <file.lgp>                 # defensive container check; exit 1 if corrupt
+lgtool manifest <file.lgp>               # provenance + failure-time system snapshot
 lgtool audit  <ring>                     # ring health: torn slots, fill, epochs
+lgtool prune  <dir> --files 50 --mb 64   # enforce retention (--dry-run supported)
 ```
 
 CI gate:
@@ -206,6 +216,12 @@ Targets: the `logguard` library (static/shared), `lgtool`, and examples
 `crash_demo`, `basic`, `c_abi`. Install with `cmake --install build`.
 
 Options: `-DLOGGUARD_ENABLE_ZSTD=ON|OFF`, `-DLOGGUARD_BUILD_TOOLS/EXAMPLES/TESTS`.
+
+Shipping a release build that must compile logging out entirely? Set
+`-DLG_LOGGING_ENABLED=OFF` to erase every convenience macro (arguments
+included), or `-DLG_COMPILE_MIN_LEVEL=4` to keep warnings and errors only;
+the same macros are available per-TU (`LG_LOGGING_ENABLED`,
+`LG_COMPILE_MIN_LEVEL`, C ABI `LG_C_LOG`/`LG_C_EVENT`).
 
 ## Layered design
 

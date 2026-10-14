@@ -15,6 +15,17 @@
 
 #include <stdint.h>
 
+/* Compile-time logging gate for C consumers. Define LG_LOGGING_ENABLED=0 to
+ * erase every LG_C_LOG/LG_C_EVENT call (including argument construction) from
+ * the translation unit; lifecycle calls are untouched. LG_C_MIN_LEVEL strips
+ * calls below a level (0 TRACE .. 5 CRITICAL). Defaults: enabled, TRACE. */
+#ifndef LG_LOGGING_ENABLED
+#define LG_LOGGING_ENABLED 1
+#endif
+#ifndef LG_C_MIN_LEVEL
+#define LG_C_MIN_LEVEL 0
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -71,6 +82,9 @@ void lg_health(lg_health_t* out);
 
 /* Offline recovery from an arbitrary process. */
 int lg_recover_export(const char* ring_path);
+/* Same, but the exported package is passed through the PII/secret redactor
+ * before it hits disk; the manifest carries a per-family redaction report. */
+int lg_recover_export_redacted(const char* ring_path);
 
 const char* lg_version(void);
 
@@ -92,6 +106,7 @@ typedef struct {
     uint32_t retain_max_packages;
     uint64_t retain_max_mb;
     int      retain_max_age_hours;
+    int      symbolize_stack; /* resolve export-time stacks to file:line */
 } lg_opts2_t;
 
 int  lg_open(const char* ring_path, const lg_opts2_t* opts);
@@ -125,6 +140,24 @@ typedef struct {
 int lg_add_sequence_to(int handle, const lg_seq_step_t* steps, int nsteps,
                        int window_ms, int cooldown_ms);
 void lg_clear_sequences_to(int handle);
+
+/* Compile-gated convenience macros for C callers. These are the logging entry
+ * points erased by LG_LOGGING_ENABLED=0; calling lg_log() directly stays
+ * unconditional (useful when a build wants an always-on audit channel). */
+#if LG_LOGGING_ENABLED
+#define LG_C_LOG(level, category, ...) \
+    do { \
+        if ((level) >= LG_C_MIN_LEVEL) lg_log((level), (category), __VA_ARGS__); \
+    } while (0)
+#define LG_C_EVENT(level, category, msg, fields) \
+    do { \
+        if ((level) >= LG_C_MIN_LEVEL) \
+            lg_event((level), (category), (msg), (fields)); \
+    } while (0)
+#else
+#define LG_C_LOG(level, category, ...) do { } while (0)
+#define LG_C_EVENT(level, category, msg, fields) do { } while (0)
+#endif
 
 #ifdef __cplusplus
 }

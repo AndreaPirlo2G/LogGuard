@@ -92,6 +92,13 @@ int lg_recover_export(const char* ring_path) {
     return lg::ring_export_readonly(ring_path, &path, &count);
 }
 
+int lg_recover_export_redacted(const char* ring_path) {
+    std::string path;
+    int count = 0;
+    return Recorder::export_readonly(ring_path, /*redact=*/true,
+                                     &path, &count);
+}
+
 const char* lg_version() { return "0.4.0"; }
 
 // ---------------- multi-instance (0.4) ----------------
@@ -121,6 +128,7 @@ int lg_open(const char* ring_path, const lg_opts2_t* opts) {
             cfg.retain_max_packages = opts->retain_max_packages;
         if (opts->retain_max_mb) cfg.retain_max_mb = opts->retain_max_mb;
         cfg.retain_max_age_hours = opts->retain_max_age_hours;
+        cfg.symbolize_stack = opts->symbolize_stack != 0;
     }
     std::string recovered;
     if (r->open(cfg, io, &recovered) != 0) {

@@ -18,6 +18,15 @@ option(LOGGUARD_BUILD_EXAMPLES "Build examples" ON)
 option(LOGGUARD_BUILD_TESTS "Build/run shell end-to-end tests" ON)
 option(LOGGUARD_BUILD_BENCH "Build microbenchmarks" OFF)
 
+# Compile-time log gate, propagated as PUBLIC definitions so any consumer that
+# links the installed target inherits it. LG_LOGGING_ENABLED=0 erases all
+# LG_*/LG_C_* convenience macros (argument construction included);
+# LG_COMPILE_MIN_LEVEL 0..5 strips levels below the threshold. Runtime level
+# filtering still works for direct lg_log() calls.
+set(LG_COMPILE_MIN_LEVEL "0" CACHE STRING "Strip log macros below this level (0 trace .. 5 critical)")
+set_property(CACHE LG_COMPILE_MIN_LEVEL PROPERTY STRINGS 0 1 2 3 4 5)
+option(LG_LOGGING_ENABLED "Emit log convenience macros at all" ON)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -79,6 +88,10 @@ target_include_directories(logguard PUBLIC
 
 find_package(Threads REQUIRED)
 target_link_libraries(logguard PUBLIC Threads::Threads)
+
+target_compile_definitions(logguard PUBLIC
+    LG_COMPILE_MIN_LEVEL=${LG_COMPILE_MIN_LEVEL}
+    LG_LOGGING_ENABLED=$<BOOL:${LG_LOGGING_ENABLED}>)
 
 if(LOGGUARD_ENABLE_ZSTD)
     target_compile_definitions(logguard PRIVATE LOGGUARD_ENABLE_ZSTD=1)
@@ -175,6 +188,16 @@ if(LOGGUARD_BUILD_TESTS)
     endif()
     add_test(NAME unit_mcap COMMAND unit_mcap)
 
+    add_executable(unit_mcap_fuzz tests/unit/test_mcap_fuzz.cpp)
+    target_include_directories(unit_mcap_fuzz PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit)
+    target_link_libraries(unit_mcap_fuzz PRIVATE logguard Threads::Threads)
+    if(HAVE_LIBDL)
+        target_link_libraries(unit_mcap_fuzz PRIVATE dl)
+    endif()
+    add_test(NAME unit_mcap_fuzz COMMAND unit_mcap_fuzz)
+
     add_executable(unit_ring tests/unit/test_ring_audit.cpp)
     target_include_directories(unit_ring PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -223,6 +246,16 @@ if(LOGGUARD_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit)
     target_link_libraries(unit_snapshot PRIVATE logguard Threads::Threads)
     add_test(NAME unit_snapshot COMMAND unit_snapshot)
+
+    # Symbolization test resolves one of its own functions; -g makes the
+    # addr2line file:line assertion meaningful in non-stripped builds.
+    add_executable(unit_symbolize tests/unit/test_symbolize.cpp)
+    target_include_directories(unit_symbolize PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit)
+    target_compile_options(unit_symbolize PRIVATE -g)
+    target_link_libraries(unit_symbolize PRIVATE logguard Threads::Threads)
+    add_test(NAME unit_symbolize COMMAND unit_symbolize)
 
     # Fault-injection end-to-end tests are POSIX-only (real SIGSEGV/SIGKILL).
     if(UNIX AND NOT APPLE)

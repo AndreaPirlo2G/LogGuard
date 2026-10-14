@@ -47,17 +47,24 @@ uint32_t write_slots(lg::McapWriter& w, const std::vector<Slot>& recs,
                      const ExportOptions& opts, ExportResult& result) {
     uint32_t seq = 0;
     const Redactor* red = opts.redactor;
+    RedactionStats acc;
+    auto add = [&acc](const RedactionStats& s) {
+        acc.phone += s.phone; acc.email += s.email; acc.id_card += s.id_card;
+        acc.bank_card += s.bank_card; acc.ipv4 += s.ipv4; acc.secret += s.secret;
+        acc.custom += s.custom;
+    };
     for (const Slot& s : recs) {
         RenderedSlot r = render_slot(s, opts.symbolizer);
         if (red) {
-            result.redacted_hits += red->apply(r.message).total();
-            if (!r.fields_json.empty())
-                result.redacted_hits += red->apply(r.fields_json).total();
+            add(red->apply(r.message));
+            if (!r.fields_json.empty()) add(red->apply(r.fields_json));
         }
         w.write_log(seq++, r.level, s.ticket, s.tid, s.wall_ns, s.mono_ns,
                     r.category.c_str(), r.request_id.c_str(), r.message.c_str(),
                     r.fields_json.empty() ? nullptr : r.fields_json.c_str());
     }
+    result.redacted_hits += acc.total();
+    result.redaction = acc;
     return seq;
 }
 
@@ -67,7 +74,7 @@ uint32_t write_slots(lg::McapWriter& w, const std::vector<Slot>& recs,
 // privacy/symbolization flags, and the observed mono time span.
 std::string build_manifest(const std::vector<Slot>& recs,
                            const ExportOptions& opts, int extra,
-                           bool crashed) {
+                           bool crashed, const RedactionStats* rs) {
     int64_t first_mono = 0, last_mono = 0;
     if (!recs.empty()) {
         first_mono = last_mono = static_cast<int64_t>(recs.front().mono_ns);
@@ -97,6 +104,20 @@ std::string build_manifest(const std::vector<Slot>& recs,
     j += opts.zstd ? "\"zstd\"" : "\"none\"";
     j += ",\"redacted\":";
     j += (opts.redactor != nullptr) ? "true" : "false";
+    j += ",\"redaction_report\":{";
+    if (rs) {
+        char r[256];
+        std::snprintf(r, sizeof(r),
+            "\"phone\":%d,\"email\":%d,\"id_card\":%d,\"bank_card\":%d,"
+            "\"ipv4\":%d,\"secret\":%d,\"custom\":%d,\"total\":%d",
+            rs->phone, rs->email, rs->id_card, rs->bank_card, rs->ipv4,
+            rs->secret, rs->custom, rs->total());
+        j += r;
+    } else {
+        j += "\"phone\":0,\"email\":0,\"id_card\":0,\"bank_card\":0,"
+             "\"ipv4\":0,\"secret\":0,\"custom\":0,\"total\":0";
+    }
+    j += "}";
     j += ",\"symbolized\":";
     j += (opts.symbolizer != nullptr) ? "true" : "false";
     j += ",\"crashed\":";
@@ -126,9 +147,10 @@ export_slots(std::vector<Slot> recs, const std::string& dir,
     lg::McapWriter w;
     if (!w.open(path)) return result;
     w.begin(opts.zstd ? "zstd" : "none");
-    w.write_manifest(wall, build_manifest(recs, opts, 0, false));
 
     uint32_t seq = write_slots(w, recs, opts, result);
+    w.write_manifest(wall, build_manifest(recs, opts, 0, false,
+                                          opts.redactor ? &result.redaction : nullptr));
     w.finish();
     result.count = static_cast<int>(seq);
     result.ok = true;
@@ -152,9 +174,9 @@ ExportResult export_window(const FileHeader& header, const Slot* slots,
     int extra = 0;
     bool crashed =
         __atomic_load_n(&header.crashed, __ATOMIC_ACQUIRE) != 0;
-    w.write_manifest(wall, build_manifest(recs, opts, crashed ? 2 : 0, crashed));
-
     uint32_t seq = write_slots(w, recs, opts, result);
+    w.write_manifest(wall, build_manifest(recs, opts, crashed ? 2 : 0, crashed,
+                                          opts.redactor ? &result.redaction : nullptr));
 
     if (crashed) {
         std::string marker = render_crash_marker(header);

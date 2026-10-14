@@ -7,6 +7,7 @@
 // the renderer and the MCAP writer — never on the recorder's global state — so
 // it is trivially unit-testable and reusable by third-party tooling.
 #include "core/slot_format.hpp"
+#include "export/redaction.hpp"
 
 #include <cstdint>
 #include <string>
@@ -18,13 +19,14 @@ class Symbolizer;
 
 namespace lg::export_ {
 
-class Redactor;
-
 struct ExportResult {
     std::string path;
     int count = 0;
     bool ok = false;
     int redacted_hits = 0; // number of sensitive tokens masked, if a redactor ran
+    // Per-family breakdown (all zero when no redactor ran). Mirrored into the
+    // package manifest as "redaction_report".
+    RedactionStats redaction;
 };
 
 struct ExportOptions {

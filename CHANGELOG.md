@@ -6,6 +6,29 @@ The format is based on Keep a Changelog; versions follow semver (0.x = no API st
 ## [Unreleased]
 
 ### Added
+- Packages now use **rolling chunks plus a trailing chunk time-index**. The
+  writer (`export/mcap_writer.*`) flushes the active chunk once it reaches a
+  size threshold (default 2 MiB, clampable to 4 KiB–64 MiB) and records, in a
+  LogGuard-specific `CHUNK_INDEX` summary section (opcode `0x40`), each chunk's
+  monotonic time span, absolute file offset, compressed/uncompressed sizes and
+  compression flag. `McapVerifier::read_chunk_index` parses it defensively and
+  `extract_range_file` answers a time-window query by binary-searching the
+  index (`O(log n)` chunks) and inflating only intersecting chunks, instead of
+  linearly walking/decompressing the whole package. Index-less packages
+  (single-chunk files written before this change) transparently fall back to a
+  full linear scan, so old `.lgp` files keep working. Older readers that don't
+  know opcode `0x40` simply skip the section — the format stays forward/
+  backward compatible.
+- `lgtool range <file.lgp> [--from-ns N] [--to-ns N]` extracts log records
+  whose monotonic timestamp falls in a window (open bounds allowed), reporting
+  whether an indexed seek or the linear fallback was used and over how many
+  chunks.
+- A deterministic **mutation fuzz** target, `unit_mcap_fuzz`, seeds from real
+  single- and multi-chunk packages (none and zstd) and applies thousands of
+  byte flips, length-field corruptions, truncations and insertions, feeding
+  every image to all parser entry points (verify, log/manifest extraction,
+  chunk-index read, ranged seek) to prove they never crash or read out of
+  bounds. It runs under AddressSanitizer/UBSan in CI-style checks.
 - Every package manifest now embeds a **failure-time environment snapshot**
   (`diagnosis/system_snapshot.*`) under `"system"`: load averages, total /
   available memory, uptime, aggregate CPU busy ratio, host process count, and
@@ -48,6 +71,42 @@ The format is based on Keep a Changelog; versions follow semver (0.x = no API st
   plus a later `previous message repeated N times` summary, so it cannot evict
   useful records. Crash markers, captured stacks and structured KV events are
   never suppressed. Default off = zero hot-path cost.
+- **Compile-time log gate** for zero-overhead release builds: define
+  `LG_LOGGING_ENABLED=0` to erase every convenience macro (C++ `LG_INFO`, …,
+  `LG_EVENT` and the new C `LG_C_LOG`/`LG_C_EVENT`) — argument construction
+  included — while lifecycle calls and direct `lg_log()` stay available;
+  `LG_COMPILE_MIN_LEVEL` (0 trace … 5 critical) / `LG_C_MIN_LEVEL` strip calls
+  below a threshold. Exposed as the CMake options `LG_LOGGING_ENABLED` and
+  `LG_COMPILE_MIN_LEVEL`, propagated `PUBLIC` to consumers.
+- **Redaction tooling end-to-end**: `lgtool redact <in.lgp> <out.lgp>` rewrites
+  an existing package with PII/secrets masked (optional `--family` allow-list,
+  `--token` literals, `--zstd`), and `lgtool recover <ring> --redact` exports a
+  crash package already masked. Every redacted manifest carries a per-family
+  `redaction_report` (phone/email/id_card/bank_card/ipv4/secret/custom/total),
+  and the C ABI gains `lg_recover_export_redacted`.
+- **Source-level stack locations**: the export-time symbolizer now shells out
+  to `addr2line -f -C` once per backing ELF (addresses batched, repeated
+  frames de-duplicated) and renders `function (file.cpp:line)` after the
+  module+offset and nearest symbol. It degrades silently to dladdr-only when
+  binutils or debug info are unavailable.
+- `lg_opts2_t` gains `symbolize_stack` so C/embedder users can opt into the
+  `addr2line` source-location pass through the stable ABI; new `unit_symbolize`
+  covers module resolution, zero/unmapped safety, `#NN` rendering and a
+  best-effort self function → file:line assertion.
+- `bench_hotpath` now measures per-call latency distributions and prints
+  **p50/p99/max** in addition to the mean, with a `--matrix` sweep over message
+  lengths × thread counts and `--iterations/--threads/--msg-len/--ring` flags.
+
+### Fixed
+- The chunk-index reader originally validated record bounds with pointer
+  arithmetic (`body + declared_len > end`); a corrupted length near
+  `UINT64_MAX` wrapped the pointer and escaped the check, allowing an
+  out-of-bounds read. Found by the new mutation fuzz under AddressSanitizer;
+  bounds are now compared as sizes against the remaining span, and ranged
+  seeks re-validate every index offset against the actual buffer.
+- Message records now carry the wall-clock time as `log_time` and the
+  monotonic time as `publish_time` (previously both were the wall value),
+  which is the clock the chunk index and time-window seeks are keyed on.
 
 ## [0.4.0] - 2026-10-13
 

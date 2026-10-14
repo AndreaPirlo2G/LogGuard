@@ -270,6 +270,83 @@ else
   fail "prune dry-run"
 fi
 
+# --- 18. package redaction: rewriter and recover --redact -------------------
+R="$W/redact.ring"; rm -f "$W"/crash-*.lgp
+"$DEMO" "$R" crash 40 >/dev/null 2>/dev/null || true
+sleep 0.3
+IN=$(recover "$R")
+if [ -n "$IN" ] && "$TOOL" redact "$IN" "$W/safe.lgp" >/dev/null 2>&1 &&
+   [ -s "$W/safe.lgp" ]; then
+  # Redacted package must still parse as valid MCAP and carry a manifest.
+  if "$TOOL" verify "$W/safe.lgp" 2>/dev/null | grep -q "MCAP OK" &&
+     "$TOOL" manifest "$W/safe.lgp" 2>/dev/null | grep -qE '"redacted": ?true'; then
+    pass "lgtool redact rewrites a valid package with a redaction report"
+  else
+    fail "lgtool redact output invalid"
+  fi
+else
+  fail "lgtool redact ($IN)"
+fi
+# --family narrows the scanner; a phone under email-only masking survives.
+"$TOOL" redact "$IN" "$W/email.lgp" --family email >/dev/null 2>&1 || true
+
+# recover --redact: direct crash export with masking enabled.
+R2="$W/redact2.ring"; rm -f "$W"/crash-*.lgp
+"$DEMO" "$R2" crash 40 >/dev/null 2>/dev/null || true
+sleep 0.3
+OUT=$("$TOOL" recover "$R2" --redact 2>/dev/null)
+RR=$(echo "$OUT" | sed -n 's/.*-> //p')
+if [ -n "$RR" ] && "$TOOL" manifest "$RR" 2>/dev/null | grep -qE '"redacted": ?true'; then
+  pass "recover --redact exports a masked package"
+else
+  fail "recover --redact ($OUT)"
+fi
+
+# --- 19. compile-time gate: LG_LOGGING_ENABLED=0 erases log calls -----------
+cat > "$W/gate_off.c" <<'EOF'
+#include <logguard/c_api.h>
+int use_gate(void) {
+    LG_C_LOG(2, "cat", "never emitted %d", 123);
+    LG_C_EVENT(2, "cat", "m", "{}");
+    return 0;
+}
+EOF
+cat > "$W/gate_on.c" <<'EOF'
+#include <logguard/c_api.h>
+int use_gate(void) {
+    LG_C_LOG(2, "cat", "emitted %d", 123);
+    return 0;
+}
+EOF
+if "${CC:-cc}" -c -I"$ROOT/include" -DLG_LOGGING_ENABLED=0 \
+      "$W/gate_off.c" -o "$W/gate_off.o" 2>/dev/null &&
+   ! nm "$W/gate_off.o" 2>/dev/null | grep -q " U lg_log"; then
+  pass "compile gate removes lg_log references when disabled"
+else
+  fail "compile gate off"
+fi
+if "${CC:-cc}" -c -I"$ROOT/include" "$W/gate_on.c" -o "$W/gate_on.o" 2>/dev/null &&
+   nm "$W/gate_on.o" 2>/dev/null | grep -q " U lg_log"; then
+  pass "log macros emit lg_log when enabled"
+else
+  fail "compile gate on"
+fi
+# Level threshold: MIN_LEVEL=WARN must drop an INFO call but keep ERROR.
+cat > "$W/gate_lvl.c" <<'EOF'
+#include <logguard/c_api.h>
+void a(void){ LG_C_LOG(2, "c", "info dropped %d", 1); }
+void b(void){ LG_C_LOG(4, "c", "error kept %d", 2); }
+EOF
+if "${CC:-cc}" -c -I"$ROOT/include" -DLG_C_MIN_LEVEL=3 \
+      "$W/gate_lvl.c" -o "$W/gate_lvl.o" 2>/dev/null &&
+   ! nm "$W/gate_lvl.o" 2>/dev/null | grep -q " U lg_event"; then
+  nlog=$(nm "$W/gate_lvl.o" 2>/dev/null | grep -c " U lg_log")
+  [ "$nlog" = "1" ] && pass "MIN_LEVEL strips below-threshold calls only" \
+                    || fail "compile min-level ($nlog)"
+else
+  fail "compile min-level build"
+fi
+
 echo "----------------------------------------"
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
